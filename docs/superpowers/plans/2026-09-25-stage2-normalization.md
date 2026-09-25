@@ -299,13 +299,25 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 def strip_accents(text: str) -> str:
-    """Remove combining diacritical marks from Latin-script characters.
+    """Remove diacritics from Latin-script characters only.
 
-    Non-Latin scripts (Devanagari, Telugu, Bengali, Gujarati, Tamil, ...) have no
-    Latin combining-mark decomposition under NFKD, so they pass through unchanged.
+    NFKD-decompose each character individually and keep the decomposition only
+    when its non-combining base is pure ASCII (i.e. it was a Latin letter with an
+    accent, like 'á' -> 'a'). Devanagari/Telugu/Bengali/Gujarati/Tamil consonants
+    AND their combining vowel signs (matras) are themselves Unicode category Mn
+    ("combining") — a naive "strip everything unicodedata.combining() flags" pass
+    corrupts Indic text by deleting matras. Checking the decomposed base is ASCII
+    before accepting it is what keeps non-Latin scripts untouched.
     """
-    decomposed = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    result = []
+    for ch in text:
+        decomposed = unicodedata.normalize("NFKD", ch)
+        base = "".join(c for c in decomposed if not unicodedata.combining(c))
+        if base and all(ord(c) < 128 for c in base):
+            result.append(base)
+        else:
+            result.append(ch)
+    return "".join(result)
 
 
 def transliterate_skeleton(text: str) -> str:
@@ -363,7 +375,7 @@ git commit -m "feat: add text_utils with accent stripping, null normalization, t
 - Consumes: nothing.
 - Produces:
   - `SUFFIX_CANONICAL_MAP: dict[str, str]` — lowercased, punctuation-stripped suffix variant → canonical token, e.g. `{"pvt": "private", "private": "private", "ltd": "limited", "limited": "limited", "inc": "inc", "incorporated": "inc", "corp": "corp", "corporation": "corp", "llc": "llc", "l.l.c": "llc", "llp": "llp", "pllc": "pllc", "lp": "lp", "co": "co", "company": "co", "sarl": "sarl", "sas": "sas"}`.
-  - `HONORIFIC_PREFIXES: frozenset[str]` — lowercased tokens to strip when they're the first token: `{"mr", "mrs", "smt", "m/s", "ms"}` (note: `"ms"` as a bare honorific is ambiguous with names like "MS Consultancy Corp" — resolved in Task 4 by only stripping when the honorific is followed by ≥2 more tokens *and* the honorific is not itself later used as an acronym match; Task 4's test pins the "MS Consultancy Corp" non-stripping case explicitly).
+  - `HONORIFIC_PREFIXES: frozenset[str]` — lowercased tokens to strip when they're the first token: `{"mr", "mrs", "smt", "shri", "m/s"}`. Deliberately excludes bare `"ms"` (no slash): it collides with names that legitimately start with the token "MS" (e.g. "MS Consultancy Corp") — only the unambiguous slashed form `"m/s"` (the Indian Messrs filing convention) is treated as an honorific. Task 4's test pins the "MS Consultancy Corp" non-stripping case explicitly.
   - `DBA_MARKER_RE: re.Pattern` — case-insensitive, matches `dba`, `d/b/a`, `trading as`, `née` as a split marker, with capture groups for the text before/after.
 
 - [ ] **Step 1: Write the failing test**
@@ -435,7 +447,11 @@ SUFFIX_CANONICAL_MAP = {
     "sas": "sas",
 }
 
-HONORIFIC_PREFIXES = frozenset({"mr", "mrs", "smt", "shri", "m/s", "ms"})
+HONORIFIC_PREFIXES = frozenset({"mr", "mrs", "smt", "shri", "m/s"})
+# Deliberately excludes bare "ms" (no slash): "M/s" (Messrs, the Indian filing
+# convention) is unambiguous, but bare "Ms" collides with names that legitimately
+# start with the token "MS" (e.g. "MS Consultancy Corp", promoter's initials) —
+# see the name_cleaner test that pins this exact case.
 
 DBA_MARKER_RE = re.compile(
     r"(?i)^(?P<before>.*?)\b(?:dba|d/b/a|trading as|née)\b:?\s*(?P<after>.*)$"
@@ -498,8 +514,12 @@ def test_suffix_mid_string_still_extracted():
 
 
 def test_compact_name_strips_punctuation_and_spaces():
+    # "Inc" is extracted into legal_suffix (not left in core_name), so it is
+    # correctly absent from compact_name too — compact_name is punctuation/space
+    # -stripped core_name, and core_name never carries the suffix.
     result = clean_name("3520 Main Road Realty Inc")
-    assert result["compact_name"] == "3520mainroadrealtyinc"
+    assert result["compact_name"] == "3520mainroadrealty"
+    assert result["legal_suffix"] == ("inc",)
 
 
 def test_dedupe_repeated_tokens_before_core_name():
@@ -585,10 +605,9 @@ from src.normalize.legal_suffixes import (
     SUFFIX_CANONICAL_MAP,
 )
 
-_PUNCT_RE = re.compile(r"[^\w\s]")
+_WORD_SPLIT_RE = re.compile(r"([\s\-]+)")  # keeps separators so we can drop them alongside a matched suffix
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-_SUFFIX_TOKEN_RE = re.compile(r"[A-Za-z.]+")
 
 
 def _split_dba(text: str) -> tuple[str, str]:
@@ -602,17 +621,28 @@ def _split_dba(text: str) -> tuple[str, str]:
 
 
 def _extract_suffixes(text: str) -> tuple[str, tuple[str, ...]]:
-    """Remove legal-suffix tokens anywhere in the string; return (remaining, canonical suffixes)."""
+    """Remove legal-suffix tokens anywhere in the string; return (remaining, canonical suffixes).
+
+    Splits on hyphens as well as whitespace — real data glues a suffix directly
+    onto an adjacent word with a hyphen (e.g. "PLLC-PARTNERS"), and a plain
+    ``text.split()`` would treat that as one unmatched token and miss the suffix
+    entirely. Dropping the separator alongside a matched suffix (the ``i += 2``
+    below) avoids leaving a dangling hyphen/space in the remaining text.
+    """
+    parts = _WORD_SPLIT_RE.split(text)
     found = []
-    kept_tokens = []
-    for raw_tok in text.split():
-        key = raw_tok.strip(".,()[]").lower().replace(".", "")
-        canonical = SUFFIX_CANONICAL_MAP.get(key)
-        if canonical:
-            found.append(canonical)
-        else:
-            kept_tokens.append(raw_tok)
-    remaining = " ".join(kept_tokens)
+    kept = []
+    i = 0
+    while i < len(parts):
+        word = parts[i]
+        key = word.strip(".,()[]").lower().replace(".", "")
+        if word and key in SUFFIX_CANONICAL_MAP:
+            found.append(SUFFIX_CANONICAL_MAP[key])
+            i += 2  # also drop the following separator
+            continue
+        kept.append(word)
+        i += 1
+    remaining = "".join(kept)
     remaining = _MULTI_SPACE_RE.sub(" ", remaining).strip(" -,()[]")
     return remaining, tuple(dict.fromkeys(found))  # dedupe, preserve order
 
