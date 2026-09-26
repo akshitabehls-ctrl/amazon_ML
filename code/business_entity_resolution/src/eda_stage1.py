@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 TRAIN = ROOT / "student_resource" / "dataset" / "train"
 TEST = ROOT / "student_resource" / "dataset" / "test"
 

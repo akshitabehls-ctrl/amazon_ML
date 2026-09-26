@@ -13,9 +13,10 @@ import sys
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SRC_DIR.parents[1]
+REPO_ROOT = SRC_DIR.parents[2]
 STUDENT_RESOURCE_DIR = REPO_ROOT / "student_resource"
 VALIDATOR = STUDENT_RESOURCE_DIR / "utils" / "validate_submission.py"
+
 
 
 def run_cmd(cmd: list[str]):
@@ -64,8 +65,6 @@ def main():
     # Step 5b: Submission Validation
     print("\n--- STEP 5b: Submission Format Validation ---")
     dataset_dir = STUDENT_RESOURCE_DIR / "dataset" / "test"
-    if not dataset_dir.exists():
-        dataset_dir = Path("d:/6ab10eb3b23ba_student_resource/student_resource/dataset/test")
 
     run_cmd([
         sys.executable,
