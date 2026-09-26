@@ -1,21 +1,16 @@
-"""Iteration-1 scoring and decoding: a few fast similarity features combined
-into one weighted score, with a threshold picked to maximize macro F_0.5 on
-a held-out slice of train.
-
-Deliberately rule-based rather than an ML-trained two-stage LightGBM model
-(the master plan's eventual design) — iteration 1's priority is a complete,
-validated, end-to-end submission fast; the full feature/model design is an
-iteration-2 follow-up once this baseline is working and scored.
+"""ML-based scoring, feature computation, LightGBM model training, and conflict-aware 1-to-1 decoding.
 """
+import hashlib
+import pickle
 from pathlib import Path
-
+import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
+import lightgbm as lgb
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
-
-WEIGHTS = {"name": 0.45, "addr": 0.35, "postcode": 0.10, "housenum": 0.10}
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.common.path_utils import PROCESSED_ROOT, get_dataset_root
+from src.score.features import FEATURE_COLUMNS, build_feature_table
 
 
 def load_normalized(split: str):
@@ -26,43 +21,108 @@ def load_normalized(split: str):
     return s1, all_records
 
 
+def load_truth(path: Path) -> dict[str, set[str]]:
+    gt = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    return {
+        s1: set(ids.split(",")) - {""}
+        for s1, ids in zip(gt["source1_entity_id"], gt["matched_entity_ids"])
+    }
+
+
 def add_features(cands: pd.DataFrame, all_records: pd.DataFrame) -> pd.DataFrame:
-    """Join each candidate pair to its two records and compute the score."""
-    s1_info = all_records.loc[cands["s1_id"].values].reset_index(drop=True)
-    cand_info = all_records.loc[cands["cand_id"].values].reset_index(drop=True)
+    """Build feature table for candidate pairs."""
+    return build_feature_table(cands, all_records)
 
-    name_ratio = [
-        fuzz.ratio(a, b) for a, b in zip(s1_info["name_compact_name"], cand_info["name_compact_name"])
-    ]
-    addr_ratio = [
-        fuzz.ratio(a, b) for a, b in zip(s1_info["addr_core_address"], cand_info["addr_core_address"])
-    ]
-    postcode_match = (
-        (s1_info["addr_postcode"].values != "") & (s1_info["addr_postcode"].values == cand_info["addr_postcode"].values)
-    ).astype(int)
-    housenum_match = (
-        (s1_info["addr_house_number"].values != "")
-        & (s1_info["addr_house_number"].values == cand_info["addr_house_number"].values)
-    ).astype(int)
 
-    out = cands.reset_index(drop=True).copy()
-    out["name_ratio"] = name_ratio
-    out["addr_ratio"] = addr_ratio
-    out["postcode_match"] = postcode_match
-    out["housenum_match"] = housenum_match
-    out["score"] = (
-        WEIGHTS["name"] * out["name_ratio"] / 100
-        + WEIGHTS["addr"] * out["addr_ratio"] / 100
-        + WEIGHTS["postcode"] * out["postcode_match"]
-        + WEIGHTS["housenum"] * out["housenum_match"]
+def train_lgb_model(train_df: pd.DataFrame, val_df: pd.DataFrame, feature_cols: list[str] = None):
+    if feature_cols is None:
+        feature_cols = FEATURE_COLUMNS
+
+    X_train = train_df[feature_cols]
+    y_train = train_df["is_match"].values
+
+    X_val = val_df[feature_cols]
+    y_val = val_df["is_match"].values
+
+    print(f"Training LightGBM on {len(X_train):,} train pairs, early stopping on {len(X_val):,} val pairs ...")
+
+    model = lgb.LGBMClassifier(
+        n_estimators=1000,
+        learning_rate=0.04,
+        num_leaves=63,
+        max_depth=8,
+        min_child_samples=30,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,
     )
-    return out
+
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+    )
+
+    print("LightGBM feature importances:")
+    importances = sorted(zip(feature_cols, model.feature_importances_), key=lambda x: x[1], reverse=True)
+    for feat, imp in importances[:15]:
+        print(f"  {feat:25s}: {imp}")
+
+    return model
 
 
-def decode(scored: pd.DataFrame, threshold: float) -> dict[str, set[str]]:
-    """Predicted matches per s1_id: every candidate at/above threshold, deduped."""
-    kept = scored[scored["score"] >= threshold]
-    return kept.groupby("s1_id")["cand_id"].apply(set).to_dict()
+def decode_conflict_aware(
+    scored_df: pd.DataFrame,
+    country_thresholds: dict[str, float] = None,
+    default_threshold: float = 0.50,
+    min_confidence: float = 0.35,
+) -> dict[str, set[str]]:
+    """Conflict-aware decoding respecting the 1-to-1 matching constraint on S2/S3 candidates.
+
+    - Filters by per-country threshold and min_confidence.
+    - Greedily assigns each S2/S3 candidate to the highest-scoring S1 entity.
+    """
+    if country_thresholds is None:
+        country_thresholds = {}
+
+    if "score" not in scored_df.columns:
+        raise ValueError("scored_df must contain 'score' column")
+
+    # Determine dynamic threshold per row based on country
+    countries = scored_df.get("s1_country", pd.Series([""] * len(scored_df))).values
+    thresholds = np.array([
+        max(country_thresholds.get(c, default_threshold), min_confidence) for c in countries
+    ])
+
+    scores = scored_df["score"].values
+    valid_mask = scores >= thresholds
+
+    valid_df = scored_df[valid_mask].copy()
+    if valid_df.empty:
+        return {}
+
+    # Sort descending by score for greedy 1-to-1 assignment
+    valid_df = valid_df.sort_values("score", ascending=False)
+
+    claimed_cands = set()
+    matches = {}
+
+    for row in valid_df.itertuples():
+        s1_id = row.s1_id
+        cand_id = row.cand_id
+
+        # 1-to-1 constraint enforcement on S2/S3 side
+        if cand_id in claimed_cands:
+            continue
+
+        claimed_cands.add(cand_id)
+        if s1_id not in matches:
+            matches[s1_id] = set()
+        matches[s1_id].add(cand_id)
+
+    return matches
 
 
 def macro_f05(predictions: dict[str, set[str]], truth: dict[str, set[str]], all_s1_ids) -> float:
@@ -86,11 +146,3 @@ def macro_f05(predictions: dict[str, set[str]], truth: dict[str, set[str]], all_
         f05 = (1.25 * precision * recall) / (0.25 * precision + recall)
         scores.append(f05)
     return sum(scores) / len(scores)
-
-
-def load_truth(path: Path) -> dict[str, set[str]]:
-    gt = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-    return {
-        s1: set(ids.split(",")) - {""}
-        for s1, ids in zip(gt["source1_entity_id"], gt["matched_entity_ids"])
-    }

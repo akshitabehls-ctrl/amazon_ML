@@ -1,0 +1,118 @@
+I need you to fix the current memory crash in our Amazon ML Challenge business entity resolution pipeline.
+
+IMPORTANT:
+Do NOT redesign the matching algorithm or change competition logic. The immediate goal is to make the existing pipeline run reliably on this Windows machine, while preserving the current architecture and outputs.
+
+PROJECT:
+D:\amazon_ML
+
+PIPELINE:
+python code/business_entity_resolution/src/run_pipeline.py
+
+The earlier import-path issue has already been fixed. The pipeline now reaches normalization, but crashes with a PyArrow memory allocation error.
+
+CURRENT ERROR:
+
+normalizing train/source1 from d:\6ab10eb3b23ba_student_resource\student_resource\dataset\train\train_source1.tsv ...
+
+Traceback:
+  File "...src\normalize\run_normalize.py", line 41, in normalize_dataframe
+    out[f"name_{field}"] = [n[field] for n in names]
+
+  pandas -> pyarrow
+
+  pyarrow.lib.ArrowMemoryError:
+  realloc of size 67108864 failed
+
+The important part is that the crash occurs while assigning normalized name columns to a pandas DataFrame, and pandas is using a PyArrow-backed string dtype. The dataset is large enough that the current implementation appears to create excessive in-memory copies / temporary objects.
+
+WHAT I WANT YOU TO DO:
+
+1. Inspect the existing code before modifying anything:
+   - src/normalize/run_normalize.py
+   - src/normalize/name_cleaner.py
+   - src/normalize/address_cleaner.py
+   - src/normalize/text_utils.py
+   - src/common/schema.py
+   - src/common/path_utils.py
+   - src/run_pipeline.py
+   - requirements.txt
+
+2. Determine exactly why pandas/PyArrow is consuming too much memory.
+   Do not assume the cause. Inspect the actual dtypes and data flow.
+
+3. Fix normalization so it is memory-efficient on a normal Windows machine.
+
+PRIORITY:
+The solution should process large TSV files without requiring enormous RAM.
+
+PREFERRED APPROACH:
+- Avoid unnecessary full-data copies.
+- Avoid constructing huge intermediate Python lists if possible.
+- Avoid PyArrow-backed string columns during the normalization transformation if they are causing the allocation problem.
+- Use memory-efficient pandas dtypes where appropriate.
+- Process columns sequentially rather than creating unnecessary duplicate DataFrames.
+- If the dataset is genuinely too large for the current architecture, implement chunked TSV processing while preserving exactly the same normalized output schema.
+- Write each processed dataset to Parquet safely.
+- Do not load all six datasets into memory simultaneously.
+- Do not change the actual normalization semantics unless absolutely necessary.
+
+VERY IMPORTANT:
+Before implementing chunking, check whether the downstream blocking/scoring code expects the entire Parquet dataset to be readable normally. If chunked processing writes multiple parquet files, either:
+A) consolidate them safely into the expected output format, OR
+B) adapt the downstream reader in a minimal way.
+
+Do NOT create a completely different data architecture just to fix this error.
+
+4. Check the Python/Pandas/PyArrow versions currently being used and make the solution compatible with the existing requirements.txt.
+
+5. After making the fix:
+   - run normalization on train/source1 first
+   - verify it completes successfully
+   - verify the output contains the expected normalized columns
+   - verify row count matches the input
+   - verify no unexpected data loss
+   - then run the complete pipeline if feasible
+
+6. If the complete pipeline fails at a later stage, fix the next issue only after confirming normalization is working.
+
+7. Preserve:
+   - existing file paths
+   - existing CLI behavior
+   - existing output names
+   - existing competition submission format
+   - existing normalization logic
+   - existing blocking/scoring architecture
+
+8. Add a small amount of logging showing:
+   - input row count
+   - processing progress
+   - memory-efficient/chunk size if chunking is used
+   - output row count
+   - output path
+
+9. Do NOT solve this by simply:
+   - reducing the dataset
+   - sampling rows
+   - deleting columns needed downstream
+   - increasing the threshold
+   - disabling normalization
+   - changing the competition dataset
+   - asking me to manually split the dataset
+   - switching to a completely different model
+
+10. After fixing it, explain:
+   A. root cause
+   B. exact files changed
+   C. exact changes made
+   D. why the fix reduces memory usage
+   E. how to run the pipeline now
+   F. whether any downstream code needed modification
+
+QUALITY BAR:
+This is a competitive entity-resolution challenge. The current baseline is intended to eventually be improved with stronger blocking, features, LightGBM, and F0.5 optimization. Do not make a temporary hack that will make future improvements difficult.
+
+The immediate objective is:
+"Make the existing pipeline reliably process the full dataset on Windows without changing its matching behavior."
+
+Start by inspecting the relevant files and diagnosing the memory issue. Do not edit until you understand the cause.

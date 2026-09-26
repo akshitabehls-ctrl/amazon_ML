@@ -2,7 +2,12 @@
 import re
 import unicodedata
 
-from unidecode import unidecode
+try:
+    from unidecode import unidecode
+except ImportError:
+    def unidecode(text: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", text)
+        return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 NAME_STOPWORDS = frozenset({"and", "the", "of", "&"})
 

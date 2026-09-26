@@ -1,16 +1,18 @@
 """Apply clean_name/clean_address to a dataframe, and a CLI to batch all 6 source files."""
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pandas as pd
 
+from src.common.path_utils import PROCESSED_ROOT, get_dataset_root
 from src.common.schema import ADDRESS_FIELDS, NAME_FIELDS, RAW_COLUMNS
 from src.normalize.address_cleaner import clean_address
 from src.normalize.name_cleaner import clean_name
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-DATASET_ROOT = REPO_ROOT / "student_resource" / "dataset"
-PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
+DATASET_ROOT = get_dataset_root()
 
 FILES = {
     ("train", "source1"): DATASET_ROOT / "train" / "train_source1.tsv",

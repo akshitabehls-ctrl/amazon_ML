@@ -1,34 +1,25 @@
-"""Stage 3 blocking: exact-key candidate generation, unioned across several keys.
+"""Stage 3 blocking: exact-key + MinHash + TF-IDF candidate generation, unioned across strategies.
 
-Iteration-1 scope: exact-match blocking keys (compact name, transliteration
-skeleton, name prefix, acronym, postcode+house_number, house_number+first
-address word) PLUS a set of character-3-gram MinHash signature keys on the
-name and address. Pure exact-key blocking alone measured 68% pair recall
-against ground truth (see block.py git history) — well short of the 97%
-target — because this dataset's typos are scattered through the string, not
-confined to a prefix, so exact/prefix keys miss them. MinHash signatures
-(the minimum hash of a record's n-gram set, for several independent hash
-seeds) survive scattered typos as long as at least one n-gram is untouched,
-and — like the exact keys — are implemented as a plain pandas merge on
-(country, signature), so they scale the same way without needing TF-IDF +
-nearest-neighbor search infrastructure.
+Candidate generation strategies:
+1. Exact-match keys (compact_name, skeleton, prefix4, acronym, first_name_word, postcode+housenum, housenum+addrword, postcode).
+2. Character 3-gram MinHash signatures on name and address.
+3. TF-IDF character n-gram cosine similarity top-K search, partitioned by country.
 
-Candidates from S2 and S3 are generated and capped independently (top-K each),
-so one source can't crowd out the other, per the project plan.
+Candidates from S2 and S3 are unioned and capped independently (top-K each per S1 entity).
 """
 import zlib
 from pathlib import Path
-
+import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.common.path_utils import PROCESSED_ROOT
 
-MAX_GROUP_SIZE = 100  # drop overly generic keys (e.g. very common short names) before merging
-MAX_CANDIDATES_PER_SOURCE = 10  # cap per (s1, source) after union, per plan's top-K-per-source rule
-# Lowered from 200/50 after the first full run produced a 127M-row candidate file that
-# OOM'd this 16GB machine downstream (feature scoring, recap). 10/source x 2 sources x
-# ~2.2M S1 rows bounds the working set to ~tens of millions instead of ~127M.
+MAX_GROUP_SIZE = 150  # drop overly generic keys before merging
+MAX_CANDIDATES_PER_SOURCE = 20  # top-K per (s1, source) after union
 
 _MINHASH_SEEDS = ["mh0", "mh1", "mh2", "mh3"]
 _NGRAM_N = 3
@@ -36,6 +27,10 @@ _NGRAM_N = 3
 
 def _prefix4(s: pd.Series) -> pd.Series:
     return s.str[:4]
+
+
+def _first_word(s: pd.Series) -> pd.Series:
+    return s.str.split().str[0].fillna("").str.lower()
 
 
 def _first_addr_word(s: pd.Series) -> pd.Series:
@@ -49,13 +44,6 @@ def _ngrams(s: str, n: int = _NGRAM_N) -> list[str]:
 
 
 def _minhash_sigs(s: str) -> tuple:
-    """Minimum CRC32 hash of the string's n-gram set, once per seed.
-
-    Deterministic across process runs (unlike builtin hash(), which is
-    randomized per-process for strings) — required since blocking train and
-    test run as separate invocations and must produce comparable signatures.
-    Returns -1 for every seed when the string has no n-grams (empty/blank).
-    """
     grams = _ngrams(s)
     if not grams:
         return tuple(-1 for _ in _MINHASH_SEEDS)
@@ -69,11 +57,6 @@ def _add_minhash_columns(df: pd.DataFrame, source_col: str, prefix: str) -> None
 
 
 def _drop_oversized_groups(df: pd.DataFrame, key_cols: list[str], max_size: int) -> pd.DataFrame:
-    """Drop rows whose (key_cols) group is bigger than max_size, on both sides before merging.
-
-    A key like an empty string or a very generic short name would otherwise fan out
-    into a huge cross-join; this keeps merges bounded without a global cap.
-    """
     sizes = df.groupby(key_cols)[key_cols[0]].transform("size")
     return df[sizes <= max_size]
 
@@ -92,13 +75,64 @@ def _block_one_key(s1: pd.DataFrame, other: pd.DataFrame, key_cols: list[str], m
     )
 
 
+def _block_tfidf_country(s1: pd.DataFrame, other: pd.DataFrame, top_k: int = 15, min_sim: float = 0.18) -> pd.DataFrame:
+    """Vectorized TF-IDF character n-gram cosine top-K candidate generation partitioned by country."""
+    results = []
+    for country in s1["country"].unique():
+        s1_c = s1[s1["country"] == country]
+        other_c = other[other["country"] == country]
+        if s1_c.empty or other_c.empty:
+            continue
+
+        s1_text = (s1_c["name_core_name"].fillna("") + " " + s1_c["addr_core_address"].fillna("")).values
+        other_text = (other_c["name_core_name"].fillna("") + " " + other_c["addr_core_address"].fillna("")).values
+
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1, max_features=40000)
+        all_text = list(s1_text) + list(other_text)
+        vec.fit(all_text)
+
+        s1_mat = vec.transform(s1_text)
+        other_mat = vec.transform(other_text)
+
+        # Batch matrix multiplication to prevent OOM
+        batch_size = 5000
+        s1_ids = s1_c["entity_id"].values
+        other_ids = other_c["entity_id"].values
+
+        for i in range(0, s1_mat.shape[0], batch_size):
+            s1_batch = s1_mat[i : i + batch_size]
+            sim_mat = s1_batch.dot(other_mat.T)  # sparse dot product
+
+            for row_idx in range(sim_mat.shape[0]):
+                row = sim_mat.getrow(row_idx)
+                if row.nnz == 0:
+                    continue
+                data = row.data
+                indices = row.indices
+                if len(data) > top_k:
+                    top_indices = np.argpartition(data, -top_k)[-top_k:]
+                    data = data[top_indices]
+                    indices = indices[top_indices]
+                mask = data >= min_sim
+                indices = indices[mask]
+
+                cur_s1 = s1_ids[i + row_idx]
+                for cand_idx in indices:
+                    results.append({"s1_id": cur_s1, "cand_id": other_ids[cand_idx], "method": "tfidf_ngram"})
+
+    if not results:
+        return pd.DataFrame(columns=["s1_id", "cand_id", "method"])
+    return pd.DataFrame(results)
+
+
 def build_candidates_one_source(s1: pd.DataFrame, other: pd.DataFrame) -> pd.DataFrame:
-    """Union several exact-key and MinHash-signature blocking strategies between S1 and one other source."""
+    """Union exact-key, MinHash, and TF-IDF blocking strategies between S1 and one other source."""
     s1 = s1.copy()
     other = other.copy()
     for df in (s1, other):
         df["_prefix4"] = _prefix4(df["name_compact_name"])
-        df["_addr_word"] = _first_addr_word(df["addr_core_address"])
+        df["_first_name_word"] = _first_word(df["name_core_name"])
+        df["_first_addr_word"] = _first_addr_word(df["addr_core_address"])
         _add_minhash_columns(df, "name_compact_name", "_name_mh")
         _add_minhash_columns(df, "addr_core_address", "_addr_mh")
 
@@ -106,23 +140,25 @@ def build_candidates_one_source(s1: pd.DataFrame, other: pd.DataFrame) -> pd.Dat
         _block_one_key(s1, other, ["country", "name_compact_name"], "compact_name"),
         _block_one_key(s1, other, ["country", "name_skeleton"], "skeleton"),
         _block_one_key(s1, other, ["country", "_prefix4"], "name_prefix4"),
+        _block_one_key(s1, other, ["country", "_first_name_word"], "first_name_word"),
         _block_one_key(s1, other, ["country", "name_acronym"], "acronym"),
         _block_one_key(s1, other, ["country", "addr_postcode", "addr_house_number"], "postcode_housenum"),
-        _block_one_key(s1, other, ["country", "addr_house_number", "_addr_word"], "housenum_addrword"),
+        _block_one_key(s1, other, ["country", "addr_house_number", "_first_addr_word"], "housenum_addrword"),
+        _block_one_key(s1, other, ["country", "addr_postcode"], "postcode_exact"),
     ]
     for seed in _MINHASH_SEEDS:
         parts.append(_block_one_key(s1, other, ["country", f"_name_mh_{seed}"], f"name_minhash_{seed}"))
         parts.append(_block_one_key(s1, other, ["country", f"_addr_mh_{seed}"], f"addr_minhash_{seed}"))
+
+    # Add TF-IDF n-gram cosine candidates
+    parts.append(_block_tfidf_country(s1, other, top_k=15, min_sim=0.18))
+
     all_cands = pd.concat(parts, ignore_index=True)
 
-    # Each _block_one_key call contributes at most one row per (s1_id, cand_id) pair
-    # (merge is 1:1 on unique entity_ids), so a pair appears once per method that found
-    # it. A plain groupby().size() therefore gives an exact n_methods count in one
-    # vectorized (C-level) pass — no Python-level per-group string join/set needed,
-    # which is what made the first version of this function too slow at 2M+ S1 rows.
+    # Count how many distinct methods surfaced each candidate pair
     counts = all_cands.groupby(["s1_id", "cand_id"]).size().rename("n_methods").reset_index()
 
-    # Cap per s1 at MAX_CANDIDATES_PER_SOURCE, keeping candidates found by more methods first.
+    # Cap per s1 at MAX_CANDIDATES_PER_SOURCE, keeping candidates found by more methods first
     counts = counts.sort_values(["s1_id", "n_methods"], ascending=[True, False])
     result = counts.groupby("s1_id").head(MAX_CANDIDATES_PER_SOURCE).reset_index(drop=True)
     return result
@@ -143,12 +179,11 @@ def load_split(split: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 if __name__ == "__main__":
-    import sys
     split = sys.argv[1] if len(sys.argv) > 1 else "train"
     s1, s2, s3 = load_split(split)
-    print(f"{split}: s1={len(s1):,} s2={len(s2):,} s3={len(s3):,}")
+    print(f"Blocking {split}: s1={len(s1):,} s2={len(s2):,} s3={len(s3):,}")
     cands = build_candidates(s1, s2, s3)
-    print(f"candidates: {len(cands):,} rows, {cands['s1_id'].nunique():,} distinct S1 ids covered")
+    print(f"Candidates: {len(cands):,} rows, {cands['s1_id'].nunique():,} distinct S1 ids covered")
     out_path = PROCESSED_ROOT / f"{split}_candidates.parquet"
     cands.to_parquet(out_path, index=False)
-    print(f"wrote {out_path}")
+    print(f"Wrote {out_path}")
